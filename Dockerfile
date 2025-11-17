@@ -21,7 +21,7 @@ COPY . .
 
 # Build the Commander binary
 # (root package is Commander — main.go in repo root)
-RUN CGO_ENABLED=0 GOOS=linux go build -o legion-commander .
+RUN CGO_ENABLED=0 GOOS=linux go build -o legion-commander ./control
 
 # ===== Runtime stage =====
 FROM alpine:3.20
