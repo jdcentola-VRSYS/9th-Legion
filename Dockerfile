@@ -1,12 +1,16 @@
 # syntax=docker/dockerfile:1
 
 # ===== Builder stage =====
-FROM golang:1.22-alpine AS builder
+# Use a modern Go image; go.mod requires go >= 1.24.5
+FROM golang:1.24-alpine AS builder
 
 WORKDIR /app
 
 # Dependencies needed for go modules + TLS
 RUN apk add --no-cache git ca-certificates && update-ca-certificates
+
+# Allow Go to auto-download the matching toolchain if needed
+ENV GOTOOLCHAIN=auto
 
 # Go module files first (better caching)
 COPY go.mod go.sum ./
