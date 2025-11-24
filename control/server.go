@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -8,12 +9,16 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	vastclient "9th-legion/control/vast"
 )
 
 // ---------- Models ----------
+
 type CPUInfo struct {
 	Model string `json:"model"`
 	Cores int    `json:"cores"`
@@ -81,15 +86,29 @@ type AgentHeartbeat struct {
 	PowerW    int    `json:"power_w,omitempty"`
 }
 
+// /api/status response
+type StatusResponse struct {
+	OK           bool   `json:"ok"`
+	Time         string `json:"time"`
+	UptimeSec    int64  `json:"uptime_sec"`
+	NodeCount    int    `json:"node_count"`
+	ProviderMode string `json:"provider_mode"`
+}
+
 // ---------- Globals ----------
+
 var (
 	mu                sync.Mutex
 	registry          = map[string]*NodeRecord{}
 	heartbeatInterval = 30 // seconds
 	staleAfter        = 2 * time.Duration(heartbeatInterval) * time.Second
+
+	startedAt    = time.Now().UTC()
+	providerMode = "standalone"
 )
 
 // ---------- Helpers ----------
+
 func randomID(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
@@ -110,6 +129,8 @@ func getPublicIP(r *http.Request) string {
 	return host
 }
 
+// Simple key check for agent endpoints.
+// Uses LEGION_KEY + X-LEGION-KEY header. (Dev mode: no key set = allow.)
 func requireKey(w http.ResponseWriter, r *http.Request) bool {
 	want := os.Getenv("LEGION_KEY")
 	got := r.Header.Get("X-LEGION-KEY")
@@ -123,7 +144,10 @@ func requireKey(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
-// ---------- Handlers ----------
+// ---------- Handlers (core) ----------
+
+// /heartbeat  (legacy)
+// /api/status (new)
 func heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(HeartbeatResponse{
@@ -131,6 +155,30 @@ func heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 		Time:    time.Now().Format(time.RFC3339),
 		Message: "9th Legion Control Node active",
 	})
+}
+
+func statusHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	mu.Lock()
+	nodeCount := len(registry)
+	mu.Unlock()
+
+	resp := StatusResponse{
+		OK:           true,
+		Time:         time.Now().UTC().Format(time.RFC3339),
+		UptimeSec:    int64(time.Since(startedAt).Seconds()),
+		NodeCount:    nodeCount,
+		ProviderMode: providerMode,
+	}
+
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func healthzHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
 
 func registerHandler(w http.ResponseWriter, r *http.Request) {
@@ -253,7 +301,60 @@ func agentHeartbeatHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// background: mark nodes stale if they stop pinging
+// ---------- Vast Offers (read-only adapter) ----------
+
+// GET /api/vast/offers?limit=20
+func vastOffersHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("[VAST] /api/vast/offers request received")
+
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Optional limit param
+	limit := 20
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 && n <= 200 {
+			limit = n
+		}
+	}
+
+	client, err := vastclient.NewFromEnv()
+	if err != nil {
+		fmt.Println("[VAST] client init error:", err)
+		http.Error(w, "vast api not configured (set VAST_API_KEY)", http.StatusBadGateway)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+
+	offers, err := client.SearchOffers(ctx, limit)
+	if err != nil {
+		fmt.Println("[VAST] search offers error:", err)
+		http.Error(w, "failed to fetch offers from vast", http.StatusBadGateway)
+		return
+	}
+
+	fmt.Printf("[VAST] fetched %d offers from Vast\n", len(offers))
+
+	resp := struct {
+		Count  int                `json:"count"`
+		Offers []vastclient.Offer `json:"offers"`
+	}{
+		Count:  len(offers),
+		Offers: offers,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		fmt.Println("[VAST] encode response error:", err)
+	}
+}
+
+// ---------- Background ----------
+
 func startStaleMonitor() {
 	ticker := time.NewTicker(15 * time.Second)
 	go func() {
@@ -270,14 +371,42 @@ func startStaleMonitor() {
 	}()
 }
 
+// ---------- main ----------
+
 func main() {
-	http.HandleFunc("/heartbeat", heartbeatHandler)
-	http.HandleFunc("/register", registerHandler)              // POST
-	http.HandleFunc("/nodes", listNodesHandler)                // GET
-	http.HandleFunc("/agent/heartbeat", agentHeartbeatHandler) // POST
+	startedAt = time.Now().UTC()
+	if mode := os.Getenv("PROVIDER_MODE"); mode != "" {
+		providerMode = mode
+	}
+
+	listenAddr := os.Getenv("LISTEN_ADDR")
+	if listenAddr == "" {
+		listenAddr = ":8081"
+	}
+
+	mux := http.NewServeMux()
+
+	// Health + status
+	mux.HandleFunc("/healthz", healthzHandler)
+	mux.HandleFunc("/api/status", statusHandler)
+
+	// Legacy endpoints (keep working)
+	mux.HandleFunc("/heartbeat", heartbeatHandler)
+	mux.HandleFunc("/register", registerHandler)              // POST
+	mux.HandleFunc("/nodes", listNodesHandler)                // GET
+	mux.HandleFunc("/agent/heartbeat", agentHeartbeatHandler) // POST
+
+	// New standardized API paths for agents
+	mux.HandleFunc("/api/agents/register", registerHandler)        // POST
+	mux.HandleFunc("/api/agents/heartbeat", agentHeartbeatHandler) // POST
+
+	// Vast read-only marketplace endpoint
+	mux.HandleFunc("/api/vast/offers", vastOffersHandler) // GET
 
 	startStaleMonitor()
 
-	fmt.Println("Legion Control listening on port 8081...")
-	http.ListenAndServe(":8081", nil)
+	fmt.Printf("Legion Control listening on %s (provider_mode=%s)...\n", listenAddr, providerMode)
+	if err := http.ListenAndServe(listenAddr, mux); err != nil {
+		fmt.Println("server error:", err)
+	}
 }
